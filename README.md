@@ -10,7 +10,7 @@ To this end, we  collect the daily closing prices for D stocks, selected within 
 
 The stocks are categorized into 11 Global Industry Classification Standard (gics) sectors, including Consumer Discretionary,Energy, Financials, Consumer Staples, Telecommunications Services, Health Care, Industrials, Information Technology, Materials, Real Estate and Utilities. It is expected that stocks from the same gics sectors should tend to be clustered together, since stocks from the same gics sector tend to interact more with each other. 
 
-The analysis is achieved using [Graphical Models](http://www.stat.cmu.edu/~larry/=sml/GraphicalModels.pdf), in particular marginal correlation graphs.
+Marginal Correlation Graphs are an example of [Graphical Models](http://www.stat.cmu.edu/~larry/=sml/GraphicalModels.pdf).
 
 ## Script and Other files descriptions
 

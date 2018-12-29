@@ -1,0 +1,944 @@
+---
+title: "Statistical Methods in Data Science"
+subtitle : "Homework 2" 
+author: "Claudio Battiloro, Egon ferri"
+date: "27 novembre 2018"
+output:
+  prettydoc::html_pretty:
+    theme: hpstr
+    highlight: github
+    toc: true
+    number_sections: true
+    df.print: tibble
+    css: css_custom.css
+
+
+---
+
+<style>
+a:link {
+    color: darkred;
+}
+a:visited{
+    color: darkred;
+}
+a:hover {
+    color: orange;
+}
+
+</style>
+
+
+\usepackage{asmath}
+
+![](https://c1.staticflickr.com/8/7171/6551520247_ae0315efb8_b.jpg?style=centerme)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r message=FALSE, warning=FALSE}
+# We need to import some useful libs 
+library(readr)
+library(tseries, quietly = TRUE)
+library(dplyr)
+library(boot)
+library(tidyverse)
+library(ggplot2)
+library(GGally)
+library(RColorBrewer)
+library(energy)
+library(knitr)
+library(latex2exp)
+library(viridis)
+library(magick)
+library(prettydoc)
+
+set.seed(12234) # For reproducibility
+```
+
+# Graphical Models
+A graphical model or probabilistic graphical model (PGM) or structured probabilistic model is a probabilistic model for which a graph expresses the conditional dependence structure between random variables. They are commonly used in probability theory, statistics-particularly Bayesian statistics-and machine learning.
+
+Graphs can be oriented -edges encode an orientation- or not.
+Undirected graphs with attached a probabilistic semantic (i.e. undirected graphical models) come in different flavors, such as:
+
+- Marginal Correlation Graphs.
+
+- Partial Correlation Graphs.
+
+- Conditional Independence Graphs.
+
+## Marginal correlation graphs: an introduction
+
+In a marginal correlation graph - or association graph - we put an edge between $V_j$ and $V_k$ if 
+\[ |\rho(j, k)| \ge \epsilon \]
+where $\rho(j, k)$ is some measure of association. Often we set $\epsilon = 0$ in which case there is an edge if and only if $\rho(j,k) \neq 0$.
+
+The parameter $\rho(j, k)$ is required to have the following property:
+\[ X \perp Y \implies \rho(X, Y ) = 0 \]
+
+In general, the reverse may not be true. We will say that $\rho\,$ is strong if:
+ \[ X \perp Y \iff \rho(X, Y ) = 0 \]
+
+In general, we would like $\rho$ to have several properties:
+
+1. easy to compute;
+
+2. robust to outliers;
+
+3. there must be some way to calculate a confidence interval for the parameter.
+
+
+# Graphical Models : A financial application.
+
+**The question: study the dependency among stocks via marginal correlation graphs.**
+
+To this end, we may collect the daily closing prices for $D$ stocks, selected within those consistently in the [S&P500 index](https://en.wikipedia.org/wiki/S%26P_500_Index) from January 1, 2003 through 2007.
+
+The stocks are categorized into 11Global Industry Classification Standard (gics) sectors, including **Consumer Discretionary,Energy, Financials, Consumer Staples, Telecommunications Services, Health Care, Industrials, Information Technology, Materials, Real Estate and Utilities**. It is expected that stocks from the same gics sectors should tend to be clustered together,
+since stocks from the same gics sector tend to interact more with each other. This is the hypothesis we'd like to verify.
+So, ideally, we want to collect something like $D/10$ stocks for each gics (or a relevant subset of gics).
+
+Each data point will correspond to the vector of relative prices on a trading day. More specifically, with $c_{t,j}$ and $o_{t,j}$ denoting the closing and opening prices of stock $j$ on day $t$, we consider the variables $x_{t,j} = log(c_{t,j}/o_{t,j})$ (as definition in *Cover(1991)*) and we want to build correlation graphs over the stock indices $j$ (i.e. each node is a stock). In other words, we simply treat the instances $\{x_{t,j}\}_t$ as independent replicates, even though they form a time series.
+
+## Data collection
+
+***Task 2 : Select a sensible portfolio of stocks and take data from January 1, 2003 through January 1, 2008, before the onset of the "financial crisis". Build the data matrix $\mathbb{X}=[x_{t,j}]_{t,j}$ ***
+
+In order to build a sensible portfolio we decide to find a consistent dataset containig various info on the [S&P500 index](https://en.wikipedia.org/wiki/S%26P_500_Index) stocks. This allows us to implement a programatic procedure to get the data and build the matrix of interest.
+
+In particular, we've choosen this [dataset](https://en.wikipedia.org/wiki/S%26P_500_Index) that appears as:
+
+
+
+```{r, warning=FALSE}
+
+Symbols_GISC <- read_csv("Symbols_GISC.csv", 
+                            col_types = cols(`52 Week High` = col_skip(), 
+                            "52 Week Low" = col_skip(), "Dividend Yield" = col_skip(), 
+                            "EBITDA" = col_skip(), "Earnings/Share" = col_skip(), 
+                            "Price" = col_skip(), "Price/Book" = col_skip(), 
+                            "Price/Earnings" = col_skip(), "Price/Sales" = col_skip(), 
+                            "SEC Filings" = col_skip()))
+
+kable(head(Symbols_GISC))
+```
+
+There are few stocks for Telecommunication Services (3) so we decide to drop them due to their weak statistical significance.
+
+At this point, we can extract data from this DS. In particular, we need the *symbol* and the *sector* of a stock. 
+The choice is grabbing the requested relative prices using **tseries** package (and *Yahoo* as provider). For each category, we try to take $D/10$ stocks and eventually catch errors and manage them dropping incomplete or missing data from the final matrix. All the procedure is vectorized, in order to get efficient and effective code. The implementation is the following one ($D_{max}=120$):
+
+```{r message=FALSE, warning=FALSE}
+
+number_of_entries <- 1258 # Number of days collected
+
+
+# This first function gets the current symbol and returns, if
+#possible, the collection ofrelative prices. In case of missing or
+#incomplete data, it returns a series of zero and prints an error
+#message. It is also possible to choose tha starting and ending
+#dates, by default setted on the requested ones.
+rel_price <- function(symbol, start_date = "2003-01-01", end_date = "2008-01-01"){
+  
+  stock <- tryCatch( {
+    
+      # We get the stock's data (suppressing outputs without errors)
+       invisible(capture.output(stock_t <- suppressWarnings(
+      get.hist.quote(instrument = symbol, start = start_date, end = end_date,
+                   quote= c("Open","Close"), provider="yahoo", drop=TRUE) )))
+      # Compute the relative price
+      stock_t$rel_price <- log(stock_t$Close/stock_t$Open)
+    
+      # And manage the two possible kinds of errors
+      if (length(stock_t$rel_price) == number_of_entries ){
+        return(stock_t$rel_price)
+      }
+      else{
+        print(paste("Incomplete Data for ",symbol,". Dropping it!"))
+        return(matrix(0, 1, number_of_entries))
+      }
+     
+      
+  },
+  error = function(err){
+    print(paste("Download Failed for ",symbol))
+    return(matrix(0, 1, number_of_entries))
+  }
+ )
+  return (stock)
+}
+
+#This function takes as input the DS, a vector containing the names
+#of the categories and the numer D of total stocks we prefer and
+#returns the subset of X containing the stocks of each sector.
+data_extractor <- function(cat_name, df, D = 120){
+  
+  cat_df <- df[which(df$Sector == cat_name),]
+  idx <- sample(nrow(cat_df),D/10, replace = FALSE)
+  cat_df <- cat_df$Symbol[idx]
+  x_i <- sapply(cat_df, rel_price)
+  return(data.frame(x_i))
+  
+}
+
+
+
+
+GISC_cat <- unique(Symbols_GISC$Sector) # Gets the sectors
+GISC_cat<- GISC_cat[which(GISC_cat != "Telecommunication Services" )]# Drops Telecommunications
+
+#Let's take a look to the errors
+Stock_collection <- lapply(GISC_cat, data_extractor, df = Symbols_GISC) # Get all the X subsets
+
+```
+
+```{r message=FALSE, warning=FALSE}
+#The following tiny loop just merges all the subsets in our desired
+#matrix Data X and the
+#final strings clean it.
+X <- array(NA, dim = c(number_of_entries,0))
+for (el in  Stock_collection){
+  X <- cbind(X,el)
+}
+X <- X[which(colSums(X) != 0)]
+
+
+# Let's take a look
+kable(X[1:10,1:7])
+```
+
+Is this a suitable "nice" portfolio? We can take a look:
+
+```{r cars}
+portfolio <- Symbols_GISC[Symbols_GISC$Symbol %in% names(X),]
+portfolio <- portfolio[order(portfolio$Sector),]
+kable(portfolio)
+```
+
+The stocks are almost of the same number for every sector, so we have a solid portfolio.
+
+## Marginal correlation graph with usual Pearson Coefficient
+
+***Task 3: With this data, consider the usual Pearson correlation coefficient between stocks, and implement the bootstrap procedure described at page 3 of our notes to build marginal correlation graphs. In particular, visualize the dynamic of the graph as $\epsilon$ varies, highlighting the gics sectors with annotation/node color. Draw some conclusion: is there any statistical evidence to support the claim that stocks from the same sector cluster together? Explain.***
+
+Statistically speaking, checking if an edge $\{j, k\}$ is in the vertex-set $E$ or not, is equivalent to test the null-hypothesis $H_0 : \rho(j, k) = 0$ versus the alternative $H_1 : \rho(j, k) \neq 0$ . 
+
+To this end we can get *simultaneous* Confidence Set for all the correlations. This is especially important if we want to put an edge when $| \rho(j, k) | \ge \epsilon$.
+
+If we have a confidence interval $C_{n, \alpha}$ then we can put an edge whenever 
+\[ [ {-} \epsilon,+\epsilon] \cap C_{n, \alpha}= \emptyset \]
+
+### Simulataneous Confidence Sets: a bootstrap procedure
+
+Here is presented a ***Bootstrap*** procedure to get a simultaneous confidece set for all the $\rho_{i,j}$ of a random vector ([Par."High Dimensional Bootstrap For Pearson Correlation"](http://www.stat.cmu.edu/~larry/=sml/GraphicalModels.pdf)) :
+
+- Let $\mathbf{R}$ be the $(D \times D)$ matrix of true correlations and let $\mathbf{\hat{R}}$ be the $(D \times D)$  matrix of sample correlations.
+
+- Now let $\{\mathbf{X}_1^*,...,\mathbf{X}_n^*\}$ denote a bootstrap sample and let $\mathbf{\hat{R}}^*$ be the $(D \times D)$ matrices of correlations from the bootstrap sample.
+
+*In this analysis*: Very roughly speaking,it means that we've to build $B$ (Bootstrap size) $\mathbb{X}^*$ matrices by shuffling the rows of $\mathbb{X}$ ($n$ is the number of the rows, so the size of our $iid$ sample for every stock) and then compute the associated $\mathbf{\hat{R}}^*$.
+
+- After taking this $B$ bootstrap samples we have $\{\mathbf{\hat{R}}^*_1,..., \mathbf{\hat{R}}^*_B\}$
+
+- Now, for each bootstrap sample $b \in \{1, . . . ,B\}$, define the following bootstrapped replicate of a simultaneous test statistics
+\[\Delta_b = \sqrt{n}\,\text{max}|\mathbf{\hat{R}}^*_b[j,k] - \mathbf{\hat{R}}[j,k]|, \]
+
+and its associated bootstrapped *ECDF*:
+\[ \hat{F}_n(t) = \frac{1}{B} \sum_{b=1}^{B} \mathbb{I}(\Delta_b  \leq t)\]
+
+- Within the usual bootstrap analogy, for large $n$ and $B$, $\hat{F}_n(t)$ should be a good approximation to
+\[ F_n(t)=\mathbb{P}(\sqrt{n}\,\text{max}|\mathbf{\hat{R}}[j,k] - \mathbf{{R}}[j,k]| \leq t)\]
+
+-Finally, to build our simultaneous confidence set, consider the sample quantile at level $1 {-} \alpha$ of the bootstrapped distribution $\hat{F}_n(t)$ , say $t_\alpha = \hat{F}^{-1}_n(1- \alpha)$, and set
+\[ C_{j,k}(\alpha) = \Big[ \hat{R}[j,k]- \frac{t_\alpha}{\sqrt{n}} , \hat{R}[j,k]+ \frac{t_\alpha}{\sqrt{n}} \Big] \]
+
+**Theorem.** *If $D=o(exp(n^{1/6}))$, then*
+
+\[ \displaystyle{\lim_{n \to \infty}}\mathbb{P}(\mathbf{R}[j,k] \in C_{j,k}(\alpha) \text{for all } (j,k)) = 1- \alpha \]
+
+### Bootstrapping the Global Economy (seriously?)
+
+Now that we got the theoretical procedure to build our Pearson-based marginal correlation graph, it's time to present some results.
+We implement the previous procedure in the following code and we obtain some interesting results. Just for consistence, these are the choosen parameters of the first simulation:
+
+- $D_{max} = 120$
+- $\epsilon = 0.28$
+- Confidence sets at level $\alpha = 0.05$ (95%)
+- Bootstrap size $B = 1000$
+
+The following chunk shows the creation of the boostrap replicates $\{ \Delta_b\}_{b=1}^{b=B}$:
+```{r message=FALSE, warning=FALSE}
+R_hat = cor(X) # Computes a plug-in estimate of the correlation matrix
+
+D = dim(X)[2] # Gets the number of stocks
+B = 1000 # Sets B
+
+#This function gets X,R_hat and the number of entries, shuffles X
+#rows in order to get the matrices of correlations from the bootstrap
+#sample X_star and computes the statistic Delta.This procedure is
+#still, clearly vectorized.
+
+delta_generator <- function(x, df = X, R_h = R_hat, n = number_of_entries){
+  idx_sample <- sample(1:dim(df)[1],dim(df)[1], replace = TRUE)
+  X_star <- df[idx_sample,]
+  R_hat_star <- cor(X_star)
+  delta_b <- sqrt(n) * max(abs(R_hat_star - R_hat))
+  return(delta_b)
+}
+# Here we get the resultsstored in a vector
+res_d <- sapply(1:B, delta_generator) 
+```
+
+Now, just for completeness, it's good to take a look to the empirical distribution $\hat{F}_n(t)$  and density of the  bootstrap replicates.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+res <- ecdf(res_d)
+plot(res, col = viridis(1),lwd = 3.0, main = "ECDF",xlab = TeX("$\\mathbf{\\Delta}$"), ylab = TeX("$\\mathbf{\\hat{F}_n(t)}$") )
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+hist(res_d, breaks = 25, col = viridis(1), prob = T, main = TeX("$\\Density\\,of\\,\\Delta$"), xlab = TeX("$\\mathbf{\\Delta}$"))
+```
+
+The next step is compute the quantile of interest from $\hat{F}_n(t)$ and then the aforementioned simulataneous confidence set. At the end, we compute the adjacency matrix of the graph by testing the appartenance of any $\rho(j,k)$ to it's corresponding *CS*.
+
+```{r}
+
+alpha <- 0.05 # Chooses alpha
+t_alpha <- quantile(res, 1- alpha) # Compute the quantile of interest (res is the ECDF of Deltas)
+
+#This function (again for a vectorized procedure) takes t_alpha, the
+#number of entries,epsilon and returns the adjacency matrix of the
+#graph by checking the intersection aforementioned.
+
+adiacence_matrix <- function(x, t = t_alpha, epsilon = 0.28, n = number_of_entries){
+  lower_bound <- max(-1,x - t/sqrt(n))
+  upper_bound <- min(1,x + t/sqrt(n))
+  if ((-epsilon > upper_bound)|(epsilon < lower_bound)){
+    return(1)
+  }
+  else{
+    return(0)
+  }
+}
+
+
+#density <- function(eps){
+A <- apply(R_hat,1:2, adiacence_matrix)
+```
+
+We have what we need to visualize the graph. For our first simulation we choose $\epsilon = 0.3$ that, with the IID assumption, represents a pretty strong correlation, so we expect to visualize stocks clustered by sectors.
+
+```{r}
+
+#This small function just allows us to assign color to nodes by
+#their sector
+sector_matcher <- function(x, df = Symbols_GISC){
+  c_row <- Symbols_GISC[which(Symbols_GISC$Symbol == x),]
+  return(c_row$Sector)
+}
+
+sectors <-sapply(colnames(A),sector_matcher)
+ggnet2(A, color = sectors, palette = "Set3", node.size = 5, node.alpha = 7/10, edge.alpha = 7/10)
+```
+
+Nice! The cluseters are evident and we are pretty sure that stocks of the same sector are more correlated than stocks of different sectors. Later we'll provide two measures of this "clustering".
+
+It's interesting to observe the changes in the graph by varying $\epsilon$. 
+
+In order to analyze this dependency we'll show four kinds of measurements, two of these are the aforementioned measures of clustering intra-sector:
+
+- A dense graph is a graph in which the number of edges is close to the maximal number of edges. The opposite, a graph with only a few edges, is a sparse graph. The distinction between sparse and dense graphs is rather vague, and depends on the context.
+For undirected simple graphs, the graph density is defined as the ratio between two times the number of edges over the total number of possible edges:
+
+\[ \delta = \frac{| E|}{\frac{|V|(|V|-1)}{2}}\] where:
+
+~ $|V|$ is the cardinality of the set of vertices, so that denominator is the total number of possible edges.
+~ $|E|$ is the cardinality of the set of edges, so the number of edges.
+
+In our case we can check how the density varies as a function of $\epsilon$.
+
+- A similiar concept ca be used to check that the stocks of the same sector are the most correlated and tend to cluster as $\epsilon$ varies. A good measure can be:
+\[ \delta_c = \frac{ \sum_{i=0}^S e_i}{|E|} \] where:
+
+-- $S$ is the number of sectors
+-- $e_i$ is the number of edges that link stocks of the $i^{th}$ sector.
+-- $|E|$ is the cardinality of the set of edges, so the number of edges.
+
+- Another measure can be defined as:
+\[ \delta_e = \frac{ \sum_{i=0}^S e_i}{\sum_{i=0}^S e_{max,i}} - \frac{P}{P_{max}} \] where:
+
+-- $e_{max,i}$ is the number of all possible edges between stocks belonging to the $i^{th}$ sector.
+-- $P$ is the number of edges that link stocks belonging to different sectors, so it can be written as $|E| - \sum_{i=0}^S e_i$
+-- $P_{max}$ is the number of all possible edges between stocks belonging to different sectors, so it can be written as $\frac{|V|(|V|-1)}{2} - \sum_{i=0}^S e_{max,i}$
+
+It's easy to observe that this quantity $\in [-1,1]$ and it is $1$ where there are perfect sectors clusters and $-1$ when there are no links among sotcks of the same sector.
+
+- A beautiful GIF that shows the evolution of the graph as $\epsilon$ grows.
+
+First of all, let's take a look at the density:
+
+```{r message=FALSE, warning=FALSE}
+#This function computes the density and saves the graphs as png in
+#order to build our GIF :D
+
+density <- function(eps, d = D){
+A <- apply(R_hat,1:2, adiacence_matrix, epsilon =eps )
+sectors <-sapply(colnames(A),sector_matcher)
+plot=ggnet2(A, color = sectors, palette = "Set3", node.size = 5, node.alpha = 7/10, edge.alpha = 7/10)
+
+#We used the next commented lines to build the gif
+#ggsave(paste(as.character(eps),".png"), plot = last_plot(), device = "png", path =
+#"C:\\Users\\Egon\\Desktop\\Universita\\SDS\\HW2")
+#tiger <- image_read(paste(as.character(eps),".png"))
+#tiger <- image_annotate(image = tiger, text = paste("Epsilon =", as.character(eps)),size =
+#50,boxcolor = #'orchid', font = 'Trebuchet')
+#image_write(tiger, path = paste(as.character(eps),".png"), format = "png")
+
+return(((length(which(A!=0))-d)/2) / (d*(d-1)/2))
+}
+
+# Let's plot delta
+epsx <- seq(0,0.7,0.05)
+d <- sapply(epsx,density)
+plot(x = epsx, y = d, col = viridis(2),lwd = 2.5, type = "l", xlab = TeX("$\\mathbf{\\epsilon}$"), ylab = TeX("$\\mathbf{\\delta}$"))
+```
+
+As we can see and as we can expect, the density of the graph decreases as $\epsilon$ increases. No correlation survives on a threshold greater than about $0.4$.
+
+Now we're going to show $\delta_c$:
+
+```{r}
+
+density <- function(eps, d = D){
+A <- apply(R_hat,1:2, adiacence_matrix, epsilon =eps )
+
+# Sectors of rows and columns
+col_sectors <- sapply(colnames(A),sector_matcher)
+row_sectors <- sapply(rownames(A),sector_matcher) 
+
+es <- 0 # the numerator of delta_c
+for(row_idx in 1:d){
+  for(col_idx in 1:d){
+    if(col_sectors[[col_idx]]==row_sectors[[row_idx]]){
+      # if the sectors of an element of A are equals,add it to
+      #the numerator
+      es <- es + A[row_idx,col_idx] 
+    }
+  }  
+}# Just our def of delta_c(-D becouse the aren't self-edges)
+delta_c = (es-d)/(length(which(A!=0))-d)
+if (is.na(delta_c)){
+  delta_c = 0
+}
+return( delta_c)
+}
+
+# Let's plot delta_c
+epsx <- seq(0,0.7,0.01)
+d1 <- sapply(epsx,density)
+plot(x = epsx, y = d1, col = viridis(2),lwd = 3.0, type = "l", xlab = TeX("$\\mathbf{\\epsilon}$"), ylab = TeX("$\\mathbf{\\delta_c}$"),panel.first=grid())
+```
+
+Also in this case the result is what we could expect. In fact,$\delta_c$ grows as the threshold grows, due to the fact that only most correlated stocks survive and this stocks are the ones in the same sector. After, when epsilon is too high, the quantity goes down to zero.
+
+The proof that in the maximum of the second curve there is the highest level of clustering by stocks of the same sector is that, at the same $\epsilon$, in the first curve there is a very low density.  Combining this observations, the only explanation possible is that the stocks of the same sector are the most correlated.
+
+Now that we have a mathematical proof of the "high" correlation among stocks belonging to same clusters, we can use $\delta_e$ to confirm this result.
+```{r}
+density <- function(eps, d=D){
+A <- apply(R_hat,1:2, adiacence_matrix, epsilon =eps )
+
+# Sectors of rows and columns
+col_sectors <- sapply(colnames(A),sector_matcher)
+row_sectors <- sapply(rownames(A),sector_matcher) 
+
+es <- 0 #Computing the numerator of the first addend
+for(row_idx in 1:d){
+  for(col_idx in 1:d){
+    if(col_sectors[[col_idx]]==row_sectors[[row_idx]]){
+      #if the sectors of an element of A are equals,add it to
+      #the numerator
+      es <- es + A[row_idx,col_idx] 
+    }
+  }  
+}
+
+B <- 0 #Computing the denominator of the first addend
+for (el in GISC_cat){
+  V_i = length(which(col_sectors==el))
+  B <- B + V_i*(V_i - 1)/2
+}# Just our def of delta_c(-D becouse the aren't self-edges)
+return( ((es-d)/2)/B - ((length(which(A!=0))-d)/2-((es-d)/2))/((d*(d - 1)/2-B)))
+}
+
+# Let's plot delta_e
+epsx <- seq(0,0.7,0.01)
+d2 <- sapply(epsx,density)
+
+plot(x = epsx, y = d2, col = viridis(2),lwd = 3.0, type = "l", xlab = TeX("$\\mathbf{\\epsilon}$"), ylab = TeX("$\\mathbf{\\delta_e}$"),panel.first=grid())
+
+```
+
+Last but not least, let's check how the graph evolves increasing $\epsilon$:
+
+![](https://media.giphy.com/media/8YpCty0iiBnLeGSyJE/giphy.gif?style=centerme)
+Is what we see for this realization the truth  or it's just a case we observed this measures? A good idea is searching for statistical significance.
+
+### Intra-sector Clustering: Hypothesis Testing
+
+We wanna show that stocks belonging to same clusters are the most correlated. By definition of $\delta$ and $\delta_e$ and with the previous observations on their beahviour, we can give statistical significance to the "clustering" by demonstrating that this two indices are negative correlated for all the value of $\epsilon$ that generate a graph with $|E| >> 0$ ($\epsilon \leq 0.5$). So we can make a Wald test at level $\alpha=0.05$ on this hypothesis:
+
+$H_0 : \rho(\delta,\delta_e) \ge 0$ and $H_1 : \rho(\delta,\delta_e) < 0$
+
+Of course the value plotted in the previous paragraph are the sample we need.
+Let's look what happens:
+
+```{r}
+alpha = 0.05
+cor.test(d1[1:50], d[1:50], alternative = "less", conf.level = 1 - alpha)
+```
+
+As we can see, we are pretty sure to reject $H_0$, and so can state that the last stocks to survive, the most correlated, are the ones that belongs to the same sectors.
+
+## Marginal correlation graph with Distance Correlation
+
+***Task 4 : Again with the data in $\mathbb{X}$, we now want to build a marginal correlation graph based on $\gamma^2$, the distance covariance. This time we don't have a confidence interval available, hence we will simply go for a multiple hypothesis testing (with and without Bonferroni correction) placing an edge {j, k} between stock j and stock k if and only if we reject the null hypothesis that $\gamma^2(i,j) = 0$. Use the functions in the package energy to perform these tests, then build and visualize the graph commenting on the results.***
+
+The **squared distance covariance** between two random vectors $\mathbf{X}$ and $\mathbf{Y}$ is defined by (*Szekely et al. 2007*)
+\[\gamma^2(\mathbf{X},\mathbf{Y}) = Cov(||\mathbf{X} - \mathbf{X'}||,||\mathbf{Y} - \mathbf{Y'}||)-2Cov(||\mathbf{X} - \mathbf{X''}||,||\mathbf{Y} - \mathbf{Y''}||)\]
+where $(\mathbf{X,Y})$, $(\mathbf{X',Y'})$ and $(\mathbf{X'',Y''})$ are independent copies, and $|| \cdot ||$ denotes the Euclidean Norm or any other suitable norm. Please notice that the random evctor $\mathbf{X}$ and $\mathbf{Y}$ can be of different dimensions.
+
+The *squared distance correlation* is then:
+\[ \rho^2(\mathbf{X},\mathbf{Y}) = \frac{\gamma^2(\mathbf{X},\mathbf{Y})}{\sqrt{\gamma^2(\mathbf{X},\mathbf{X})\gamma^2(\mathbf{Y},\mathbf{Y})}}\]
+
+**Theorem.** *We have that* $\rho(\mathbf{X},\mathbf{Y}) \in [0,1]$ *and* 
+\[ \rho(\mathbf{X},\mathbf{Y})=0 \iff \mathbf{X} \perp \mathbf{Y} \]
+
+## Analysis on stock using Distance Correlation
+
+### Simple treshold checking
+
+To build the graph using *Distance Correlation* we don't have CI so a first, *not simultaneous*, approach can be:
+
+- Compute all possible distance correlation among stocks.
+
+- Check if their abs are greater than a threshold $\epsilon$ and, in this case, place an edge between the corresponding stocks.
+
+We implement this procedure in the following code, for $\epsilon=0.27$
+
+```{r message=FALSE, warning=FALSE}
+alpha <- 0.1# Chooses alpha
+D = 30 # A subset, due to computational issues
+# This function returns the squared distance correlation
+#for a pair of stock (still vectorized procedure)
+dcor_dis <- function(x,y, df = X){ 
+  rho <- dcor.test(df[x],df[y], R = 500)$statistic
+  return(rho)
+}
+comb <- combn(names(X)[1:D], 2) 
+D_hat <- mapply(dcor_dis, x = comb[1,],y = comb[2,]) # Returns a vector containing the
+#squared distance correlations
+
+
+
+edges_generator <- function(x,epsilon = 0.33){ 
+  if (abs(D_hat[x])>epsilon){
+    return(1)
+  }
+  else{
+    return(0)
+  }
+}
+# A vector of edges corresponding to the "correlated" pairs of stocks
+edges <- sapply(1:length(D_hat),edges_generator) 
+
+A1 <-matrix(NA, nrow = D, ncol = D) # Initializes the adjacency matris
+row.names(A1) <- names(X)[1:D]
+colnames(A1) <- names(X)[1:D]
+
+for (idx in 1:length(edges)){ # And builds it
+A1[comb[1,idx],comb[2,idx]] <- edges[idx]
+A1[comb[2,idx],comb[1,idx]] <- edges[idx]
+}
+diag(A1) = 1
+
+# As before
+sectors1 <-sapply(colnames(A1),sector_matcher)
+ggnet2(A1, color = sectors1, palette = "Set3", node.size = 5, node.alpha = 7/10, edge.alpha = 7/10)
+```
+ 
+ It seems that this basic approach doen't give us too much information, it's a messy and not meaningful graph. We can go deeper.
+ 
+### Multiple Testing
+
+To reach a simultaneous control on the probability of **type 1** error of putting an edge if the correlation is under a choosen threshold $\epsilon$ (the null hypothesis for the $(i,j)^{th}$ pair has to not being rejected), there are two ways:
+
+- Family-Wise Error Rate: in this case, it's requested
+
+\[ FWER_\epsilon=\mathbb{P}(R_F(\epsilon) \ge 1) \leq \alpha\]
+where $R_F(\epsilon)$ is the number of false positives for the threshold $\epsilon$.
+
+***Bonferroni Correction*** to achive this type of error control.
+
+- False Discovery Rate: a "relaxed" control on the mean of the ratio between false positive and total positive defined as
+
+\[ \mathbb{E}\Big(\frac{R_F(\epsilon)}{R(\epsilon)} \Big)=\mathbb{E}(FDP_t) \leq \alpha \] and
+
+\[FDR_t = \mathbb{E}(FDP_t) \]
+
+***Benjamini-Hochberg Correction*** to achive this type of error control.
+
+### Family-Wise Error Rate: Bonferroni Correction
+
+This type of control,as seen above, is very strict and so it's useful when *false discoveries* can't be tolerated. Given a collection of hypothesis($m$ tests), the $k^{th}$ null hypotheses is rejected if, for a given level of control $\alpha$:
+
+\[ q^{(k)} = min\{m \cdot p^{(k)},1\} \leq \alpha\] where $p^{(k)}$ is the p_value of the $k^{th}$ test. $q^{(k)}$ is called *Bonferroni q_value*.
+
+Let's see how this strategy works for our purposes. The following code generates the graph associated to our data using Distance Correlation and Bonferroni Correction. Please note that formally we are testing $m = {D_{sub}\choose2}$ hypothesis.
+
+```{r message=FALSE, warning=FALSE}
+alpha <- 0.1 # Chooses 
+#This function returns the p-values corresponding to distance correlation test
+#for a pair of stock (still vectorized procedure)
+dcor_dis <- function(x,y, df = X){ 
+  rho <- dcor.test(df[x],df[y], index = 0.001, R = 500)$p.value
+  return(rho)
+}
+comb <- combn(names(X)[1:D], 2) # All possible combination of stocks
+
+# Returns a vector containing the p_values
+D_hat_p <- mapply(dcor_dis, x = comb[1,],y = comb[2,]) 
+edges_generator_p <- function(x,epsilon = 0.31, d = D){ 
+  if (abs(D_hat_p[x])<= alpha/choose(d,2)){
+    return(1)
+  }
+  else{
+    return(0)
+  }
+}
+# A vector of edges corresponding to the "correlated" pairs of stocks
+edges <- sapply(1:length(D_hat_p),edges_generator_p)
+
+A1 <-matrix(NA, nrow = D, ncol = D) # Initializes the adjacency matrix
+row.names(A1) <- names(X)[1:D]
+colnames(A1) <- names(X)[1:D]
+
+for (idx in 1:length(edges)){ # And builds it
+A1[comb[1,idx],comb[2,idx]] <- edges[idx]
+A1[comb[2,idx],comb[1,idx]] <- edges[idx]
+}
+diag(A1) = 1
+
+# As before
+sectors1 <-sapply(colnames(A1),sector_matcher)
+ggnet2(A1, color = sectors1, palette = "Set3", node.size = 5, node.alpha = 7/10, edge.alpha = 7/10)
+```
+
+From this test results that all the stocks are independent from the others. Actually, it's not like this. The value of the p-values are not enough small and this is due to the small number of permutations $R$ choosen. In fact, growing up $R$ we can obtain, in this case, arbitrarily small p-values. After this observation we can state that all stocks are correlated. This makes sense, because distance correlation is able to detect also non linear dependencies. Anyways this strong correlation is still a bit weird.
+The explanation is that we're assuming the observations are IID while they're a **time series** and, under this hypothesis, we can count on a very large sample size $n$ that allows to compute very high-power tests.
+
+
+
+For these reasons p-values are small and are all equals (it's not easy to estimate such small values).
+Moreover, this kind of distance is useful to check the dependency between two W-dimensional random vectors  $X$ and $Y$ in the limit for $W$ and $n$. In this case $n$ is big but $W=1$ becouse every stock is an univariate r.v. .
+This makes the **Type 1 Error** control weaker and, in this sense, we can enforce our results by checking how the density of the graph $\delta$ varies as $\alpha$ goes down. In this way,we can figure out which is the critical value for $\alpha$ (in light of what we've written) that swithces the graph from full connected to edge-less.
+
+In the light of this observations we can try to use another kind of *asymptotic* test based on correlation distance that is implmented in R (in the package **Rfast**).This implementation has a very useful option that allows to return ***logged*** p-values, so the smallest values are dilated by $log$. Let's check if something changes by plotting the density of the graph as $\alpha$ varies.
+
+
+```{r message=FALSE, warning=FALSE}
+
+#This function returns the p-values corresponding to distance correlation test
+#for a pair of stock (still vectorized procedure)
+#detach("package::energy", unload=TRUE) # We have to switch the packages
+library(Rfast)
+D = dim(X)[2] # For this no permutation test we can use the whole dataset
+dcor_dis <- function(x,y, df = X){
+  rho <- Rfast::dcor.ttest(x = as.matrix(df[x]),y = as.matrix(df[y]), logged = T)
+  return(rho[4])
+}
+
+comb <- combn(names(X)[1:D], 2) # All possible combination of stocks
+
+# Returns a vector containing the p_values
+D_hat_p <- mapply(dcor_dis, x = comb[1,],y = comb[2,]) 
+
+edges_generator_p <- function(x, d = D,al){ 
+  if (D_hat_p[x]<= log(al/choose(d,2))){
+    return(1)
+  }
+  else{
+    return(0)
+  }
+}
+
+check_edges <- function(alpha){
+
+# A vector of edges corresponding to the "correlated" pairs of stocks
+edges <- sapply(1:length(D_hat_p),edges_generator_p, al = alpha)
+
+A1 <-matrix(NA, nrow = D, ncol = D) # Initializes the adjacency matrix
+row.names(A1) <- names(X)[1:D]
+colnames(A1) <- names(X)[1:D]
+
+for (idx in 1:length(edges)){ # And builds it
+A1[comb[1,idx],comb[2,idx]] <- edges[idx]
+A1[comb[2,idx],comb[1,idx]] <- edges[idx]
+}
+diag(A1) = 1
+
+return(((length(which(A1!=0))-D)/2) / (D*(D-1)/2))
+
+}
+
+alphax <- seq(from = 0.01, to = 0.0001, by = -0.0005)
+d_a <- sapply(X = alphax,FUN = check_edges)
+plot(x = alphax, y = d_a, col = viridis(2),lwd = 3.0, type = "l", xlab = TeX("$\\mathbf{\\alpha}$"), ylab = TeX("$\\mathbf{\\delta}$"),panel.first=grid())
+```
+
+
+From the figure we can see that the graph is full connected also for very small values of $\alpha$ and this is consistent with what we noticed above, the null hypothesis is always rejected.
+The positive thing, with this test, is that we can take a look to the distribution of the p-values to get a visual perception of what it's happened. Moreover, we highlight the logged smallest tested $\alpha/m$ and the logged high p-value to better understand that there is no way, with IID hypothesis on this kind of data, to not reject the null using this test procedure.
+
+
+```{r}
+hist(D_hat_p, breaks = 80, col = viridis(1), prob = T, main = TeX("$\\Density\\,of\\,p-values$"), xlab = TeX("$p-values$"))
+
+```
+```{r echo=FALSE}
+print(paste("Max log p-value:", max(D_hat_p),"Minimum log(alpha/m):",log(0.0001/choose(D,2))))
+```
+
+
+### False Discovery Rate: Benjamini-Hochberg Correction
+
+It's clear that what we've seen in the previous paragraph is still valid but, just for completeness, let's try also the Benjamini-Hochberg Correction.
+
+This is,generally (for meaningful cases), a weaker type of control than Bonferroni Correction.
+It allows us to control the mean of the aforementioned ratio between *false positives* and *total positives*. The following procedure achives this type of control:
+
+- Find the ordered p_values: $p^{(1)} < ... < p^{(m)}$
+- Let $j = max\{k : p^{(k)} < k \cdot \frac{\alpha}{m}\}$
+- Decision rule: Reject all the hypothesis having $p^{(k)} < p^{(j)}$
+
+Let's see what happens with our data:
+
+```{r}
+
+sorted_p <- sort(D_hat_p)
+p_j = -1
+idx = 1
+
+# Finds p_j (they're all equal in this case,obviously)
+for (el in sorted_p){
+  if (el < idx * alpha/choose(D,2)){
+    p_j = el
+  }
+  idx = idx + 1
+} 
+edges_generator_h <- function(x){ 
+  if (abs(D_hat_p[x])<=p_j){
+    return(1)
+  }
+  else{
+    return(0)
+  }
+}
+# A vector of edges corresponding to the "correlated" pairs of stocks
+
+edges <- sapply(1:length(D_hat_p),edges_generator_h) 
+A1 <-matrix(NA, nrow = D, ncol = D) # Initializes the adjacency matrix
+row.names(A1) <- names(X)[1:D]
+colnames(A1) <- names(X)[1:D]
+
+for (idx in 1:length(edges)){ # And builds it
+A1[comb[1,idx],comb[2,idx]] <- edges[idx]
+A1[comb[2,idx],comb[1,idx]] <- edges[idx]
+}
+diag(A1) = 1
+
+# As before
+sectors1 <-sapply(colnames(A1),sector_matcher)
+ggnet2(A1, color = sectors1, palette = "Set3", node.size = 5, node.alpha = 7/10, edge.alpha = 7/10)
+```
+
+Obviously ,for this applciations,this technique is useless too but we tought it would be useful to proof.
+
+There are other ways to get some kind of more meaningful test for this situation, but this is not the place.
+
+## What's happening today? 
+
+In this last section we repeat the analysis taking into account the same stock that we considered before, downloading their relative prices from January 1, 2013 through January 1, 2018.
+
+We perform this task to check if our result and conclusion still holds, and, if so, to reinforce our hypotesis.
+
+Downloading the file:
+
+```{r}
+number_of_entries= 1259
+x_i <- sapply(names(X), rel_price, start_date = "2013-01-01", end_date = "2018-01-01")
+X_2=data.frame(x_i)
+```
+
+Creating our correlation matrix and computing Ecdf and his density:
+
+```{r}
+R_hat = cor(X_2) # Computes a plug-in estimate of the correlation                   matrix
+
+D = dim(X_2)[2] # Gets the number of stocks
+B = 1000 # Sets B
+
+res_d <- sapply(1:B, delta_generator, df= X_2)
+res <- ecdf(res_d)
+plot(res, col = viridis(1),lwd = 3.0, main = "ECDF",xlab = TeX("$\\mathbf{\\Delta}$"), ylab = TeX("$\\mathbf{\\hat{F}_n(t)}$") )
+```
+
+```{r}
+hist(res_d, breaks = 25, col = viridis(1), prob = T, main = TeX("$\\Density\\,of\\,\\Delta$"), xlab = TeX("$\\mathbf{\\Delta}$"))
+```
+
+Bulding adiacence matrix and plotting our graph:
+
+```{r}
+alpha <- 0.05 # Chooses alpha
+t_alpha <- quantile(res, 1- alpha) # Compute the quantile of interest
+
+
+
+#density <- function(eps){
+A_2 <- apply(R_hat,1:2, adiacence_matrix)
+
+sectors <-sapply(colnames(A_2),sector_matcher)
+ggnet2(A_2, color = sectors, palette = "Set3", node.size = 5, node.alpha = 7/10, edge.alpha = 7/10)
+```
+
+As we can see, sector ar again pretty clustered. Visually we immediatly verify the result that we found in the previous paragraphs. 
+
+In order to get a mathematical solid confirm we repeat the anlysis that we performed before. Results are conistent and comforting.
+
+Analyzing how the density varies as $\epsilon$ goes up:
+
+```{r}
+
+density <- function(eps, d = D ){
+A_2 <- apply(R_hat,1:2, adiacence_matrix, epsilon =eps)
+sectors <-sapply(colnames(A_2),sector_matcher)
+ggnet2(A_2, color = sectors , palette = "Set3")
+return(length(which(A_2!=0)) / (d*(d-1)/2))
+}
+
+# Let's plot delta
+epsx <- seq(0,0.7,0.01)
+d <- sapply(epsx,density)
+plot(x = epsx, y = d, col = viridis(2),lwd = 2.5, type = "l", xlab = TeX("$\\mathbf{\\epsilon}$"), ylab = TeX("$\\mathbf{\\delta}$"),panel.first=grid())
+```
+
+
+Showing $\delta_c$ and $\delta_e$:
+
+```{r}
+#This function computes the density and saves the graphs as png in #order to build our GIF :D
+density <- function(eps, d = D ){
+A_2 <- apply(R_hat,1:2, adiacence_matrix, epsilon =eps )
+
+# Sectors of rows and columns
+col_sectors <- sapply(colnames(A_2),sector_matcher)
+row_sectors <- sapply(rownames(A_2),sector_matcher) 
+
+es <- 0 # the numerator of delta_c
+for(row_idx in 1:d){
+  for(col_idx in 1:d){
+    if(col_sectors[[col_idx]]==row_sectors[[row_idx]]){
+      #if the sectors of an element of A are equals,add it
+      #to the numerator
+      es <- es + A_2[row_idx,col_idx] 
+    }
+  }  
+}
+delta_c = (es-d)/(length(which(A_2!=0))-d)
+if (is.na(delta_c)){
+  delta_c = 0
+}
+return( delta_c)
+}
+
+# Let's plot delta
+epsx <- seq(0,0.7,0.01)
+d1 <- sapply(epsx,density)
+plot(x = epsx, y = d1, col = viridis(2),lwd = 3.0, type = "l", xlab = TeX("$\\mathbf{\\epsilon}$"), ylab = TeX("$\\mathbf{\\delta_c}$"),panel.first=grid())
+
+```
+
+```{r}
+density <- function(eps, d = D ){
+A <- apply(R_hat,1:2, adiacence_matrix, epsilon =eps )
+
+# Sectors of rows and columns
+col_sectors <- sapply(colnames(A),sector_matcher)
+row_sectors <- sapply(rownames(A),sector_matcher) 
+
+es <- 0 #Computing the numerator of the first addend
+for(row_idx in 1:d){
+  for(col_idx in 1:d){
+    if(col_sectors[[col_idx]]==row_sectors[[row_idx]]){
+      # if the sectors of an element of A are equals,add it to the         # numerator
+      es <- es + A[row_idx,col_idx] 
+    }
+  }  
+}
+
+B <- 0 #Computing the denominator of the first addend
+for (el in GISC_cat){
+  V_i = length(which(col_sectors==el))
+  B <- B + V_i*(V_i - 1)/2
+}
+# Just our def of delta_c(-D becouse the aren't self-edges)
+return( ((es-d)/2)/B - ((length(which(A!=0))-d)/2-((es-d)/2))/((d*(d - 1)/2-B)))
+}
+
+# Let's plot delta_e
+epsx <- seq(0,0.7,0.01)
+d2 <- sapply(epsx,density)
+
+plot(x = epsx, y = d2, col = viridis(2),lwd = 3.0, type = "l", xlab = TeX("$\\mathbf{\\epsilon}$"), ylab = TeX("$\\mathbf{\\delta_e}$"),panel.first=grid())
+```
+
+As we can see, we obtain again what we expect and we confirm our previous hypotesis. Just for completeness, let's remake the hyp. test presented above.
+
+```{r}
+alpha = 0.05
+cor.test(d1[1:50], d[1:50], alternative = "less", conf.level = 1 - alpha)
+```
+
+
+
+
+## Conclusions
+
+Analysing our graphs we can make some statments. 
+
+Taking into account the data downloaded between the 2003 and the 2008 we see that the sector of "Utilities", "Energy" and "Real estate" are correlated mostly with stocks of their sector.
+We can see also a big cluster that contains all "Financial" stock, some stock of the "Industrial" sector and some of the "Consumer discretionary" sector. This makes sense.
+
+Repeating the job with recent data we discover that this results hold and are even enforced. The stocks that clustered a lot cluster more, and "Consumer staples", that in the first time-slot had his stocks all alone now cluster.
+
+# Appendix: Signal Processing on Graph
+In this small Appendix we wanna suggest some tools that can be very useful in this kind of analysis and that come from other disciplinar sectors, like signal processing.
+
+Nowadays, applications such as social, energy, transportation, sensor,and neuronal networks, high-dimensional data and ,of course, financial data naturally reside on the vertices of weighted graphs. The emerging field of [signal processing on graphs](https://arxiv.org/abs/1211.0053) merges algebraic and spectral graph theoretic concepts with computational harmonic analysis to process such signals on graphs.
+
+We don't want to introduce the math behind this interesting theory but, just for completeness in the definition, a signal on a graph is defined as a *map* from the set $V$ of nodes into the set of complex numbers $\mathbb{C}$:
+\[\mathbb{s}: V \rightarrow \mathbb{C} \]
+\[ \mathbf{s} = [s_1,...,s_{|V|}]^T \]
+
+each element $s_n$ being indexed by node $n$.
+
+It's clear that, in our analysis, we have a signal (a daily relative price of all the stocks) that evolves in time.
+
+The theory presents a lot of useful tools also for correlation graphs. For example, in this task we learn the graph topology using statistical tools and then we stop. Of course many other things can be done. Using the [sampling theory for signals on graph](https://arxiv.org/abs/1503.05432) we can try to reconstruct missing data for a given stock by knowing the graph and the prices of a finite number of other stocks ( we can reconstruct a full signal by an its subsampled version) and this can be done by using only the current day data or the entire time series (solid notions of discrete diffusion theory are available) . This procedure are guaranteed and can be extended to more sophisticated application (more on, just to mention one active researcher, [Gonzalo Mateos](https://www.researchgate.net/scientific-contributions/2049675778_Gonzalo_Mateos) page).
